@@ -1,186 +1,233 @@
 import os
 from pathlib import Path
-import pandas as pd
 import numpy as np
-from sklearn.model_selection import TimeSeriesSplit
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import mean_absolute_percentage_error
 from sklearn.preprocessing import LabelEncoder
-import lightgbm as lgb
-from datetime import datetime
-import holidays
 
+# Models
+from xgboost import XGBRegressor
+from lightgbm import LGBMRegressor
+from catboost import CatBoostRegressor
 
-def calcuate_mape(y_true, y_pred):
-    """Calcuate Mean Absolute Percentage Error"""
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    # avoid zero division
-    mask = y_true != 0
-    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+# ----------------- CONFIG -------------------
+# You can tune these or load from a hyperparameter search
+xgb_params = {
+    'n_estimators': 500,
+    'learning_rate': 0.05,
+    'max_depth': 8,
+    'min_child_weight': 8,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'gamma': 0.0,
+    'reg_alpha': 0.0,
+    'reg_lambda': 1.0,
+    'random_state': 42
+}
 
+lgb_params = {
+    'n_estimators': 500,
+    'learning_rate': 0.05,
+    'max_depth': -1,
+    'num_leaves': 64,
+    'min_child_samples': 20,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'reg_alpha': 0.0,
+    'reg_lambda': 1.0,
+    'verbosity': -1,
+    'random_state': 42
+}
 
-def create_features(df, is_train=True):
-    """Create time series features from datetime index"""
-    df = df.copy()
+cat_params = {
+    'iterations': 500,
+    'learning_rate': 0.05,
+    'depth': 8,
+    'loss_function': 'MAPE',
+    'random_state': 42,
+    'silent': True
+}
 
-    # Convert date to datetime if it isn't already
-    df["date"] = pd.to_datetime(df["date"])
+N_SPLITS = 5  # KFold splits
 
-    # Basic time features
-    df["year"] = df["date"].dt.year
-    df["month"] = df["date"].dt.month
-    df["day"] = df["date"].dt.day
-    df["dayofweek"] = df["date"].dt.dayofweek
-    df["quarter"] = df["date"].dt.quarter
-    df["is_weekend"] = df["dayofweek"].isin([5, 6]).astype("int")
+# ----------------- READ DATA -------------------
+# Kaggle environment:
+#   /kaggle/input/playground-series-s5e1/train.csv
+#   /kaggle/input/playground-series-s5e1/test.csv
+#   /kaggle/input/playground-series-s5e1/sample_submission.csv
+path = Path("/home/sonujha/rnd/Forecasting-Sticker-Sales/data/")
+train_data = pd.read_csv(path/'train.csv')
+test_data  = pd.read_csv(path/'test.csv')
+sample_sub = pd.read_csv(path/'sample_submission.csv')
 
-    # Create holiday features of each country
-    for country in df["country"].unique():
-        country_holidays = holidays.CountryHoliday(country)
-        df.loc[df["country"] == country, "is_holiday"] = (
-            df[df["country"] == country]["date"]
-            .map(lambda x: x in country_holidays)
-            .astype(int)
-        )
-    if is_train:
-        # Lag features (previous 7, 14, 30 days)
-        for lag in [7, 14, 30]:
-            df[f"sales_lag_{lag}"] = df.groupby(["country", "store", "product"])[
-                "num_sold"
-            ].shift(lag)
+print("Initial train_data shape:", train_data.shape)
+print("Initial test_data shape: ", test_data.shape)
 
-        # Rolling window features
-        for window in [7, 14, 30]:
-            df[f"sales_rolling_mean_{window}"] = df.groupby(
-                ["country", "store", "product"]
-            )["num_sold"].transform(
-                lambda x: x.rolling(window=window, min_periods=1).mean()
-            )
+# ----------------- CLEAN & PREPARE TRAIN -------------------
+# 1) Drop duplicates
+train_data.drop_duplicates(inplace=True)
 
-    return df
+# 2) Drop missing target rows
+train_data.dropna(subset=['num_sold'], inplace=True)
 
+# 3) Convert 'date' to datetime if needed
+train_data['date'] = pd.to_datetime(train_data['date'], errors='coerce')
+test_data['date']  = pd.to_datetime(test_data['date'],  errors='coerce')
 
-def train_model(train_df):
-    """Train LightGBM model with time series features"""
-    # Create features
-    df = create_features(train_df)
+# 4) Extract date features (you can add day-of-week, etc. if you want)
+train_data['Year']  = train_data['date'].dt.year
+train_data['Month'] = train_data['date'].dt.month
+train_data['Day']   = train_data['date'].dt.day
 
-    # Encode categorical variables
-    le_dict = {}
-    for col in ["country", "store", "product"]:
-        le = LabelEncoder()
-        df[f"{col}_encoded"] = le.fit_transform(df[col])
-        le_dict[col] = le
+test_data['Year']  = test_data['date'].dt.year
+test_data['Month'] = test_data['date'].dt.month
+test_data['Day']   = test_data['date'].dt.day
 
-    # Define Features
-    feature_cols = [
-        "year",
-        "month",
-        "day",
-        "dayofweek",
-        "quarter",
-        "is_weekend",
-        "is_holiday",
-        "country_encoded",
-        "store_encoded",
-        "product_encoded",
-        "sales_lag_7",
-        "sales_lag_14",
-        "sales_lag_30",
-        "sales_rolling_mean_7",
-        "sales_rolling_mean_14",
-        "sales_rolling_mean_30",
-    ]
+# 5) Drop the 'date' column if you no longer need it directly
+train_data.drop('date', axis=1, inplace=True)
+test_data.drop('date',  axis=1, inplace=True)
 
-    # remove rows with NaN values (first month will have NaN for lag features)
-    df = df.dropna()
+# 6) Log-transform the target
+train_data['num_sold'] = np.log1p(train_data['num_sold'])
 
-    # Time-based validation split
-    train_size = int(len(df) * 0.8)  # using 80% for training
-    train_data = df.iloc[:train_size]
-    valid_data = df.iloc[train_size:]
+# 7) Drop 'id' from training, we'll use it from test
+train_data.drop('id', axis=1, inplace=True)
 
-    # Split features and target
-    X_train = train_data[feature_cols]
-    y_train = train_data["num_sold"]
-    X_valid = valid_data[feature_cols]
-    y_valid = valid_data["num_sold"]
+# Identify numerical and categorical columns
+num_cols = train_data.select_dtypes(include=np.number).drop(columns=['num_sold']).columns.tolist()
+cat_cols = train_data.select_dtypes(include='object').columns.tolist()
 
-    # Train model
-    params = {
-        "objective": "regression",
-        "metric": "mape",
-        "boosting_type": "gbdt",
-        "num_leaves": 31,
-        "learning_rate": 0.05,
-        "feature_fraction": 0.9,
-        "colsample_bytree": 0.9,
-    }
+# The test set also has 'id', we'll keep it for submission
+# but we won't use it as a feature
+test_ids = test_data['id'].copy()  # save for submission
+test_data.drop('id', axis=1, inplace=True)
 
-    model = lgb.LGBMRegressor(**params)
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_valid, y_valid)],
-        eval_metric="mape",
-    )
+# ----------------- ENCODE CATEGORICAL -------------------
+label_encoders = {}
+for col in cat_cols:
+    le = LabelEncoder()
+    train_data[col] = le.fit_transform(train_data[col])
+    label_encoders[col] = le
 
-    # Calculate and print validation score
-    val_predictions = model.predict(X_valid)
-    valid_mape = calcuate_mape(y_valid, val_predictions)
-    print(f"\n Validation MAPE: {valid_mape:.2f}%")
+    # Transform test data with the same encoder
+    if col in test_data.columns:
+        test_data[col] = le.transform(test_data[col])
 
-    return model, le_dict, feature_cols
+# ----------------- SEPARATE FEATURES/TARGET -------------------
+X = train_data.drop(['num_sold'], axis=1)
+y = train_data['num_sold']
+X_test_final = test_data.copy()  # for final predictions
 
+# ----------------- DEFINE MAPE -------------------
+def mape(y_true, y_pred):
+    return mean_absolute_percentage_error(y_true, y_pred)
 
-def prepare_test_data(test_df, train_df, le_dict):
-    """Prepare test data with same features as training data"""
-    # Create features
-    test_df["num_sold"] = 0
-    df = create_features(test_df)
+# ----------------- CROSS-VALIDATION FUNCTIONS -------------------
+def cross_val_xgb(X, y, X_test, params, n_splits=5):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    mape_scores = []
+    test_preds_list = []
 
-    # Fill missing lag features with training data
-    full_data = pd.concat([train_df, test_df], axis=0, sort=False)
-    full_data = create_features(full_data, is_train=True)
+    for train_idx, valid_idx in kf.split(X):
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-    # Get the last row only (test_set)
-    df = full_data.iloc[-len(test_df) :]
+        model = XGBRegressor(**params)
+        model.fit(X_train, y_train)
 
-    # Encode categorical variables using same encoder as training
-    for col in ["country", "store", "product"]:
-        df[f"{col}_encoded"] = le_dict[col].transform(df[col])
+        y_pred_valid = model.predict(X_valid)
+        score = mape(y_valid, y_pred_valid)
+        mape_scores.append(score)
 
-    return df
+        # Predict on the test set
+        y_test_pred = model.predict(X_test)
+        test_preds_list.append(y_test_pred)
 
+    # Average test predictions across folds
+    test_preds_mean = np.mean(test_preds_list, axis=0)
+    return np.mean(mape_scores), test_preds_mean
 
-def make_prediction(model, test_df, train_df, le_dict, feature_cols):
-    """Make prediction on test data"""
-    # Prepare test data
-    df = prepare_test_data(test_df, train_df, le_dict)
+def cross_val_lgbm(X, y, X_test, params, n_splits=5):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    mape_scores = []
+    test_preds_list = []
 
-    # Make preidction
-    predictions = model.predict(df[feature_cols])
+    for train_idx, valid_idx in kf.split(X):
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-    # Create submission dataframe
-    submission = pd.DataFrame({"id": test_df["id"], "num_sold": predictions})
+        model = LGBMRegressor(**params)
+        model.fit(X_train, y_train)
 
-    return submission
+        y_pred_valid = model.predict(X_valid)
+        score = mape(y_valid, y_pred_valid)
+        mape_scores.append(score)
 
+        # Predict on test
+        y_test_pred = model.predict(X_test)
+        test_preds_list.append(y_test_pred)
 
-# Main execution
-def main():
-    # load the data
-    path = Path("/home/sonujha/rnd/Forecasting-Sticker-Sales/data/")
-    train_df = pd.read_csv(os.path.join(path, "train.csv"))
-    test_df = pd.read_csv(os.path.join(path, "test.csv"))
+    test_preds_mean = np.mean(test_preds_list, axis=0)
+    return np.mean(mape_scores), test_preds_mean
 
-    # Train model
-    model, le_dict, feature_cols = train_model(train_df)
+def cross_val_catboost(X, y, X_test, params, n_splits=5):
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    mape_scores = []
+    test_preds_list = []
 
-    # Make Predictions
-    submission = make_prediction(model, test_df, train_df, le_dict, feature_cols)
+    for train_idx, valid_idx in kf.split(X):
+        X_train, X_valid = X.iloc[train_idx], X.iloc[valid_idx]
+        y_train, y_valid = y.iloc[train_idx], y.iloc[valid_idx]
 
-    # Save prediction
-    submission.to_csv("submission.csv", index=False)
+        model = CatBoostRegressor(**params)
+        model.fit(X_train, y_train, eval_set=(X_valid, y_valid), verbose=False)
 
+        y_pred_valid = model.predict(X_valid)
+        score = mape(y_valid, y_pred_valid)
+        mape_scores.append(score)
 
-if __name__ == "__main__":
-    main()
+        # Predict on test
+        y_test_pred = model.predict(X_test)
+        test_preds_list.append(y_test_pred)
+
+    test_preds_mean = np.mean(test_preds_list, axis=0)
+    return np.mean(mape_scores), test_preds_mean
+
+# ----------------- TRAIN & PREDICT WITH EACH MODEL -------------------
+print("=== Training XGB ===")
+xgb_cv_score, xgb_test_preds = cross_val_xgb(X, y, X_test_final, xgb_params, n_splits=N_SPLITS)
+print(f"XGB - Mean CV MAPE: {xgb_cv_score:.4f}")
+
+print("\n=== Training LGBM ===")
+lgb_cv_score, lgb_test_preds = cross_val_lgbm(X, y, X_test_final, lgb_params, n_splits=N_SPLITS)
+print(f"LGBM - Mean CV MAPE: {lgb_cv_score:.4f}")
+
+print("\n=== Training CatBoost ===")
+cat_cv_score, cat_test_preds = cross_val_catboost(X, y, X_test_final, cat_params, n_splits=N_SPLITS)
+print(f"CatBoost - Mean CV MAPE: {cat_cv_score:.4f}")
+
+# ----------------- ENSEMBLE / BLEND -------------------
+# A simple approach is an unweighted average
+ensemble_test_preds = (xgb_test_preds + lgb_test_preds + cat_test_preds) / 3.0
+
+# You could also do a weighted average if one model is much stronger:
+# ensemble_test_preds = (0.4 * lgb_test_preds) + (0.3 * xgb_test_preds) + (0.3 * cat_test_preds)
+
+# ----------------- CREATE SUBMISSION -------------------
+# Recall we log-transformed the target, so exponentiate predictions
+final_num_sold = np.expm1(ensemble_test_preds)
+
+submission = pd.DataFrame({
+    'id': test_ids,
+    'num_sold': final_num_sold
+})
+
+print("\nSample Submission Preview:")
+print(submission.head())
+
+submission.to_csv("submission_ensemble.csv", index=False)
+print("\nSubmission file 'submission_ensemble.csv' created!")
