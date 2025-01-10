@@ -1,164 +1,235 @@
-import lightgbm as lgb
 import numpy as np
 import pandas as pd
+import lightgbm as lgb
+import xgboost as xgb
+import catboost as cb
 from pathlib import Path
 from sklearn.model_selection import KFold, train_test_split
 from sklearn.metrics import mean_absolute_percentage_error
+from category_encoders import TargetEncoder
 import optuna
+from optuna.integration import LightGBMPruningCallback, XGBoostPruningCallback, CatBoostPruningCallback
 import warnings
 warnings.filterwarnings('ignore')
 
+# Set a random seed for reproducibility
+RANDOM_STATE = 42
+
+# --------------------------------------
+# 1. Load Data
+# --------------------------------------
 path = Path('data')
 train = pd.read_csv(path/'train.csv')
 test = pd.read_csv(path/'test.csv')
 sub = pd.read_csv(path/'sample_submission.csv')
 
-# drop the missing rows
-train = train.dropna()
-test = test.dropna()
+# Drop rows where target is missing
+train = train.dropna(subset=['num_sold'])
+
+# --------------------------------------
+# 2. Basic Preprocessing
+# --------------------------------------
 
 
-def transform_date(df, col):
-    # Convert the column to datetime
+def transform_date(df, col='date'):
     df[col] = pd.to_datetime(df[col])
+    df[f'{col}_year'] = df[col].dt.year
+    df[f'{col}_month'] = df[col].dt.month
+    df[f'{col}_day'] = df[col].dt.day
+    df[f'{col}_day_of_week'] = df[col].dt.dayofweek
+    df[f'{col}_week_of_year'] = df[col].dt.isocalendar().week
 
-    # Extract temporal features
-    df[f'{col}_year'] = df[col].dt.year.astype('float64')
-    df[f'{col}_quarter'] = df[col].dt.quarter.astype('float64')
-    df[f'{col}_month'] = df[col].dt.month.astype('float64')
-    df[f'{col}_day'] = df[col].dt.day.astype('float64')
-    df[f'{col}_day_of_week'] = df[col].dt.dayofweek.astype('float64')
-    df[f'{col}_week_of_year'] = df[col].dt.isocalendar().week.astype('float64')
-    df[f'{col}_hour'] = df[col].dt.hour.astype('float64')
-    df[f'{col}_minute'] = df[col].dt.minute.astype('float64')
-
-    # Add cyclical encodings
-    df[f'{col}_day_sin'] = np.sin(2 * np.pi * df[f'{col}_day'] / 365.0)
-    df[f'{col}_day_cos'] = np.cos(2 * np.pi * df[f'{col}_day'] / 365.0)
+    # Cyclical features
+    df[f'{col}_day_sin'] = np.sin(
+        2 * np.pi * df[f'{col}_day'] / 31.0)  # day out of max 31
+    df[f'{col}_day_cos'] = np.cos(2 * np.pi * df[f'{col}_day'] / 31.0)
     df[f'{col}_month_sin'] = np.sin(2 * np.pi * df[f'{col}_month'] / 12.0)
     df[f'{col}_month_cos'] = np.cos(2 * np.pi * df[f'{col}_month'] / 12.0)
-    df[f'{col}_year_sin'] = np.sin(2 * np.pi * df[f'{col}_year'] / 7.0)
-    df[f'{col}_year_cos'] = np.cos(2 * np.pi * df[f'{col}_year'] / 7.0)
 
-    # Add group feature (for time-based grouping)
-    df[f'{col}_Group'] = (df[f'{col}_year'] - 2010) * \
-        48 + df[f'{col}_month'] * 4 + df[f'{col}_day'] // 7
-
+    # Example grouping feature
+    df[f'{col}_group'] = (df[f'{col}_year'] - 2010) * 12 + df[f'{col}_month']
     return df
 
 
-# handle datetime column
-new_train = transform_date(train, 'date')
-new_test = transform_date(test, 'date')
+train = transform_date(train, 'date')
+test = transform_date(test, 'date')
 
-# removing un-necessary columns
-new_train['num_sold'] = np.log1p(new_train['num_sold'])
-new_train = new_train.drop(columns=['date', 'id'], axis=1)
-new_test = new_test.drop(columns=['date', 'id'], axis=1)
+# Drop original date & ID if not needed
+drop_cols = ['date', 'id']
+if set(drop_cols).issubset(train.columns):
+    train.drop(columns=drop_cols, inplace=True)
+if set(drop_cols).issubset(test.columns):
+    test.drop(columns=drop_cols, inplace=True)
 
+# --------------------------------------
+# 3. Feature/Target Setup
+# --------------------------------------
+# Log-transform the target
+train['num_sold'] = np.log1p(train['num_sold'])
 
-# handling categorical columns
-num_cols = list(new_train.select_dtypes(
-    exclude=['object']).columns.difference(['num_sold']))
-cat_ftrs = list(new_train.select_dtypes(include=['object']).columns)
+# Split into features & target
+X_full = train.drop(columns=['num_sold'])
+y_full = train['num_sold']
 
-num_cols_test = list(new_test.select_dtypes(
-    exclude=['object']).columns.difference(['id']))
-cat_ftrs_test = list(new_test.select_dtypes(include=['object']).columns)
+# We will encode test data similarly
+X_test = test.copy()
 
-train_test_comb = pd.concat([new_train, new_test], axis=0, ignore_index=True)
-for col in cat_ftrs:
-    train_test_comb[col], _ = train_test_comb[col].factorize()
-    train_test_comb[col] -= train_test_comb[col].min()
-    # label encode to categorical and convert int32 to category
-    train_test_comb[col] = train_test_comb[col].astype('int32')
-    train_test_comb[col] = train_test_comb[col].astype('category')
+# Identify categorical columns
+cat_cols = X_full.select_dtypes(include=['object']).columns.tolist()
 
-for col in num_cols:
-    if train_test_comb[col].dtype == 'float64':
-        train_test_comb[col].astype('float32')
-    if train_test_comb[col].dtype == 'int64':
-        train_test_comb[col].astype('int32')
+# --------------------------------------
+# 4. Advanced Encoding: Target Encoding
+# --------------------------------------
+encoder = TargetEncoder(cols=cat_cols)
+X_full = encoder.fit_transform(X_full, y_full)
+X_test = encoder.transform(X_test)
 
-new_train = train_test_comb.iloc[:len(new_train)].copy()
-new_test = train_test_comb.iloc[len(new_train):].copy()
+# Optionally, ensure numeric dtypes
+for col in X_full.columns:
+    if X_full[col].dtype == 'float64':
+        X_full[col] = X_full[col].astype('float32')
+for col in X_test.columns:
+    if X_test[col].dtype == 'float64':
+        X_test[col] = X_test[col].astype('float32')
 
-new_test = new_test.drop(columns='num_sold', axis=1)
-
-X = new_train.drop(columns=['num_sold'])
-y = new_train['num_sold']
-
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.2, random_state=42)
+# --------------------------------------
+# 5. Optuna Hyperparameter Tuning
+#    with possibility to try different models
+# --------------------------------------
 
 
 def objective(trial):
-    params = {
-        'boosting_type': 'gbdt',
-        'objective': 'regression',
-        'metric': 'mape',  # We'll evaluate on MAPE
-        'n_estimators': trial.suggest_int('n_estimators', 100, 1000),
-        'learning_rate': trial.suggest_loguniform('learning_rate', 0.01, 0.3),
-        'max_depth': trial.suggest_int('max_depth', 5, 15),
-        'reg_alpha': trial.suggest_loguniform('reg_alpha', 1e-4, 1.0),
-        'lambda_l2': trial.suggest_loguniform('lambda_l2', 1e-4, 1.0),
-        'min_child_samples': trial.suggest_int('min_child_samples', 20, 100),
-        'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0),
-        'subsample': trial.suggest_uniform('subsample', 0.5, 1.0),
-        'random_state': 42,
-        'verbose': -1,
-        'device': 'cpu'
-    }
+    model_choice = trial.suggest_categorical(
+        'model_choice', ['lgbm', 'xgb', 'catboost'])
 
-    model = lgb.LGBMRegressor(**params)
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)])
+    # Common hyperparameters
+    n_estimators = trial.suggest_int('n_estimators', 500, 2000)
+    lr = trial.suggest_loguniform('learning_rate', 0.01, 0.3)
 
-    y_pred = model.predict(X_val)
-    mape = mean_absolute_percentage_error(y_val, y_pred)
-    return mape
+    # Shared cross-validation
+    kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    mape_scores = []
+
+    for train_idx, valid_idx in kf.split(X_full):
+        X_train_cv, X_valid_cv = X_full.iloc[train_idx], X_full.iloc[valid_idx]
+        y_train_cv, y_valid_cv = y_full.iloc[train_idx], y_full.iloc[valid_idx]
+
+        if model_choice == 'lgbm':
+            params = {
+                'boosting_type': 'gbdt',
+                'objective': 'regression',
+                'metric': 'mape',
+                'n_estimators': n_estimators,
+                'learning_rate': lr,
+                'max_depth': trial.suggest_int('max_depth', 5, 15),
+                'reg_alpha': trial.suggest_loguniform('reg_alpha', 1e-4, 1.0),
+                'reg_lambda': trial.suggest_loguniform('reg_lambda', 1e-4, 1.0),
+                'min_child_samples': trial.suggest_int('min_child_samples', 5, 100),
+                'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0),
+                'subsample': trial.suggest_uniform('subsample', 0.5, 1.0),
+                'random_state': RANDOM_STATE
+            }
+            model = lgb.LGBMRegressor(**params)
+            model.fit(
+                X_train_cv, y_train_cv,
+                eval_set=[(X_valid_cv, y_valid_cv)],
+                eval_metric='mape',
+            )
+
+        elif model_choice == 'xgb':
+            params = {
+                'objective': 'reg:squarederror',
+                'eval_metric': 'mape',
+                'n_estimators': n_estimators,
+                'learning_rate': lr,
+                'max_depth': trial.suggest_int('max_depth', 5, 15),
+                'subsample': trial.suggest_uniform('subsample', 0.5, 1.0),
+                'colsample_bytree': trial.suggest_uniform('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_loguniform('reg_alpha', 1e-4, 1.0),
+                'reg_lambda': trial.suggest_loguniform('reg_lambda', 1e-4, 1.0),
+                'random_state': RANDOM_STATE,
+                'verbosity': 0
+            }
+            model = xgb.XGBRegressor(**params)
+            model.fit(
+                X_train_cv, y_train_cv,
+                eval_set=[(X_valid_cv, y_valid_cv)],
+            )
+
+        else:  # CatBoost
+            params = {
+                'iterations': n_estimators,
+                'learning_rate': lr,
+                'depth': trial.suggest_int('depth', 5, 15),
+                'l2_leaf_reg': trial.suggest_loguniform('l2_leaf_reg', 1e-4, 1.0),
+                'random_seed': RANDOM_STATE,
+                'logging_level': 'Silent',
+                'loss_function': 'MAPE'
+            }
+            model = cb.CatBoostRegressor(**params)
+            model.fit(
+                X_train_cv, y_train_cv,
+                eval_set=(X_valid_cv, y_valid_cv),
+            )
+
+        y_pred_cv = model.predict(X_valid_cv)
+        fold_mape = mean_absolute_percentage_error(y_valid_cv, y_pred_cv)
+        mape_scores.append(fold_mape)
+
+    return np.mean(mape_scores)
 
 
-# Run Optuna optimization
-study = optuna.create_study(direction='minimize')
-study.optimize(objective, n_trials=50)
+# Create study with pruning
+study = optuna.create_study(
+    direction='minimize', study_name='Sales Forecasting')
+# Increase n_trials if possible
+study.optimize(objective, n_trials=100, timeout=3600)
 
-# Best parameters and MAPE
-print("Best parameters:", study.best_params)
+print("Best params:", study.best_params)
 print("Best MAPE:", study.best_value)
 
-# Use the best parameters found by Optuna for final training and prediction
-lgb_params = study.best_params
-lgb_params.update({
-    'device': 'cpu',                # Use GPU for training
-    'n_jobs': -1,                   # Use all available CPU threads
-})
+# --------------------------------------
+# 6. Train Final Model (Ensemble or Single Best)
+# --------------------------------------
+best_model_name = study.best_params['model_choice']
+best_params = {k: v for k, v in study.best_params.items() if k not in [
+    'model_choice']}
 
-# K-Fold Cross-validation with LightGBM
-scores, lgb_test_preds = [], []
+# Refit using the entire dataset with cross-validation predictions
+kf = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+oof_preds = np.zeros(len(X_full))
+test_preds = np.zeros(len(X_test))
 
-kfold = KFold(n_splits=5, shuffle=True, random_state=42)
-for i, (train_idx, val_idx) in enumerate(kfold.split(X)):
-    print(f'Fold {i}')
-    X_train_fold, X_val_fold = X.iloc[train_idx].copy(), X.iloc[val_idx].copy()
-    y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
+for fold, (train_idx, valid_idx) in enumerate(kf.split(X_full)):
+    print(f"Fold {fold+1}")
+    X_train_cv, X_valid_cv = X_full.iloc[train_idx], X_full.iloc[valid_idx]
+    y_train_cv, y_valid_cv = y_full.iloc[train_idx], y_full.iloc[valid_idx]
 
-    # Train the model with the best parameters
-    lgb_model = lgb.LGBMRegressor(**lgb_params)
-    lgb_model.fit(X_train_fold, y_train_fold,
-                  eval_set=[(X_val_fold, y_val_fold)])
+    if best_model_name == 'lgbm':
+        final_model = lgb.LGBMRegressor(
+            **best_params, random_state=RANDOM_STATE)
+    elif best_model_name == 'xgb':
+        final_model = xgb.XGBRegressor(
+            **best_params, random_state=RANDOM_STATE)
+    else:
+        # CatBoost
+        final_model = cb.CatBoostRegressor(
+            **best_params, random_seed=RANDOM_STATE, verbose=False)
 
-    y_preds = lgb_model.predict(X_val_fold)
-    mape_score = mean_absolute_percentage_error(y_val_fold, y_preds)
-    print(f'MAPE Score for fold {i}:', mape_score)
-    scores.append(mape_score)
-    lgb_test_preds.append(lgb_model.predict(X))
+    final_model.fit(X_train_cv, y_train_cv)
+    oof_preds[valid_idx] = final_model.predict(X_valid_cv)
 
-# Calculate mean and std of MAPE
-lgb_score = np.mean(scores)
-lgb_std = np.std(scores)
+    # Predict on test for each fold; average later
+    test_preds += final_model.predict(X_test) / kf.n_splits
 
-print(f"Mean MAPE: {lgb_score}, Std MAPE: {lgb_std}")
+fold_mape = mean_absolute_percentage_error(y_full, oof_preds)
+print("OOF MAPE:", fold_mape)
 
-sub['num_sold'] = np.expm1(lgb_model.predict(new_test))
-sub.to_csv('submission.csv', index=False)
+# --------------------------------------
+# 7. Prepare Submission
+# --------------------------------------
+# Inverse log transform
+sub['num_sold'] = np.expm1(test_preds)
+sub.to_csv("submission.csv", index=False)
 sub.head()
+
